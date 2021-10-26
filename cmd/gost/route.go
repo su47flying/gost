@@ -245,6 +245,8 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		connector = gost.SOCKS4Connector()
 	case "socks4a":
 		connector = gost.SOCKS4AConnector()
+	case "socks5over":
+		connector = gost.SOCKS5OverConnector(node.User)
 	case "ss":
 		connector = gost.ShadowConnector(node.User)
 	case "ssu":
@@ -264,6 +266,7 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 	default:
 		connector = gost.AutoConnector(node.User)
 	}
+	log.Logf("Transport:Protocol %s %s", node.Transport, node.Protocol)
 
 	host := node.Get("host")
 	if host == "" {
@@ -560,6 +563,8 @@ func (r *route) GenRouters() ([]router, error) {
 			handler = gost.SOCKS5Handler()
 		case "socks4", "socks4a":
 			handler = gost.SOCKS4Handler()
+		case "socks5over":
+			handler = gost.SOCKS5OverHandler()
 		case "ss":
 			handler = gost.ShadowHandler()
 		case "http":
@@ -598,7 +603,8 @@ func (r *route) GenRouters() ([]router, error) {
 				handler = gost.AutoHandler()
 			}
 		}
-
+		
+		log.Logf("Transport:Protocol %v:%v", node.Transport, node.Protocol)
 		var whitelist, blacklist *gost.Permissions
 		if node.Values.Get("whitelist") != "" {
 			if whitelist, err = gost.ParsePermissions(node.Get("whitelist")); err != nil {

@@ -3,6 +3,7 @@ package gost
 import (
 	"errors"
 	"fmt"
+	"github.com/go-log/log"
 	"net/url"
 	"strconv"
 	"strings"
@@ -73,7 +74,6 @@ func ParseNode(s string) (node Node, err error) {
 		node.Protocol = schemes[0]
 		node.Transport = schemes[1]
 	}
-
 	switch node.Transport {
 	case "https":
 		node.Transport = "tls"
@@ -112,10 +112,13 @@ func ParseNode(s string) (node Node, err error) {
 	case "ftcp": // fake TCP
 	case "dns", "dot", "doh":
 	case "relay":
+	case "socks5over":
+		node.Protocol = "socks5over"
 	default:
 		node.Protocol = ""
 	}
 
+	log.Logf("Transport:Protocol %s %s", node.Transport, node.Protocol)
 	return
 }
 

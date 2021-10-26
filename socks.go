@@ -819,6 +819,9 @@ func SOCKS5Handler(opts ...HandlerOption) Handler {
 }
 
 func (h *socks5Handler) Init(options ...HandlerOption) {
+	if Debug {
+		log.Logf("[socks5 init")
+	}
 	if h.options == nil {
 		h.options = &HandlerOptions{}
 	}

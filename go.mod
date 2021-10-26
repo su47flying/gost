@@ -18,6 +18,7 @@ require (
 	github.com/go-gost/relay v0.1.0
 	github.com/go-log/log v0.2.0
 	github.com/gobwas/glob v0.2.3
+	github.com/golang/mock v1.6.0 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/gorilla/websocket v1.4.2
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
@@ -28,17 +29,22 @@ require (
 	github.com/lucas-clemente/quic-go-certificates v0.0.0-20160823095156-d2f86524cced // indirect
 	github.com/miekg/dns v1.1.35
 	github.com/milosgajdos83/tenus v0.0.0-20190415114537-1f3ed00ae7d8
+	github.com/mmcloughlin/avo v0.2.0 // indirect
+	github.com/onsi/ginkgo v1.16.5 // indirect
+	github.com/onsi/gomega v1.16.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/ryanuber/go-glob v1.0.0
 	github.com/shadowsocks/go-shadowsocks2 v0.1.3
 	github.com/shadowsocks/shadowsocks-go v0.0.0-20170121203516-97a5c71f80ba
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
+	github.com/su47flying/gosocks5xor v0.2.0
+	github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161 // indirect
 	github.com/templexxx/xor v0.0.0-20191217153810-f85b25db303b // indirect
 	github.com/tjfoc/gmsm v1.3.2 // indirect
 	github.com/xtaci/kcp-go v5.4.20+incompatible
+	github.com/xtaci/lossyconn v0.0.0-20200209145036-adba10fffc37 // indirect
 	github.com/xtaci/smux v1.5.15
 	github.com/xtaci/tcpraw v1.2.25
-	golang.org/x/crypto v0.0.0-20200128174031-69ecbb4d6d5d
-	golang.org/x/net v0.0.0-20190923162816-aa69164e4478
-	golang.org/x/text v0.3.4 // indirect
+	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
+	golang.org/x/net v0.0.0-20210428140749-89ef3d95e781
 )
