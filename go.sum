@@ -111,6 +111,8 @@ github.com/su47flying/gosocks5xor v0.1.0 h1:j720LY53N47w9r9lenL8uk7PvL12wjGBY0y2
 github.com/su47flying/gosocks5xor v0.1.0/go.mod h1:6+Sb483UVX43A71mjYbIlFfy79TVIoFk35J9kiKEAE0=
 github.com/su47flying/gosocks5xor v0.2.0 h1:XJWgkf6kdtpPzyUzKbb4t+N7g1UT7/Rms06jp9oB2yo=
 github.com/su47flying/gosocks5xor v0.2.0/go.mod h1:6+Sb483UVX43A71mjYbIlFfy79TVIoFk35J9kiKEAE0=
+github.com/su47flying/gosocks5xor v0.3.0 h1:YpZdJmhszSr3KOntaippUPrt5N7wqwsT6mHofZZQ8A8=
+github.com/su47flying/gosocks5xor v0.3.0/go.mod h1:6+Sb483UVX43A71mjYbIlFfy79TVIoFk35J9kiKEAE0=
 github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161 h1:89CEmDvlq/F7SJEOqkIdNDGJXrQIhuIx9D2DBXjavSU=
 github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161/go.mod h1:wM7WEvslTq+iOEAMDLSzhVuOt5BRZ05WirO+b09GHQU=
 github.com/templexxx/xor v0.0.0-20191217153810-f85b25db303b h1:fj5tQ8acgNUr6O8LEplsxDhUIe2573iLkJc+PqnzZTI=
