@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -27,11 +28,13 @@ func (l *stringList) Set(value string) error {
 }
 
 type route struct {
-	ServeNodes stringList
-	ChainNodes stringList
-	Retries    int
-	Mark       int
-	Interface  string
+	ServeNodes   stringList
+	ChainNodes   stringList
+	ReverseNodes stringList
+	TunnelNodes  stringList
+	Retries      int
+	Mark         int
+	Interface    string
 }
 
 func (r *route) parseChain() (*gost.Chain, error) {
@@ -244,6 +247,8 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		tr = gost.UDPTransporter()
 	case "vsock":
 		tr = gost.VSOCKTransporter()
+	case "xor":
+		tr = gost.TCPTransporter() // XOR is layered on top of plain TCP
 	default:
 		tr = gost.TCPTransporter()
 	}
@@ -274,6 +279,8 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		connector = gost.HTTPConnector(node.User)
 	case "relay":
 		connector = gost.RelayConnector(node.User)
+	case "xor":
+		connector = gost.XORConnector(node.User)
 	default:
 		connector = gost.AutoConnector(node.User)
 	}
@@ -353,6 +360,31 @@ func (r *route) GenRouters() ([]router, error) {
 
 	var rts []router
 
+	// NOPORT reverse-tunnel infrastructure listeners (-R=admin://, -R=XOR://).
+	// These must come first so that AdminHubs are registered before any
+	// -L= listeners may need them, and so that A-side -T= clients have a
+	// stable target on this same B host (when running combined).
+	for _, ns := range r.ReverseNodes {
+		rt, err := genReverseRouter(ns)
+		if err != nil {
+			return nil, err
+		}
+		rts = append(rts, rt)
+	}
+
+	// NOPORT A-side admin tunnel clients (-T=admin://). These are not
+	// "routers" in the listener sense, but we model them with a degenerate
+	// router so that main.go's go routers[i].Serve() loop drives them.
+	for _, ns := range r.TunnelNodes {
+		rt, err := genTunnelRouter(ns)
+		if err != nil {
+			return nil, err
+		}
+		rts = append(rts, rt)
+	}
+
+	noportEnabled, noportXORKey := noportContext(r.ReverseNodes)
+
 	for _, ns := range r.ServeNodes {
 		node, err := gost.ParseNode(ns)
 		if err != nil {
@@ -411,6 +443,8 @@ func (r *route) GenRouters() ([]router, error) {
 
 		var ln gost.Listener
 		switch node.Transport {
+		case "xor":
+			ln, err = gost.XORListener(node.Addr, []byte(nodePassword(node)))
 		case "tls":
 			ln, err = gost.TLSListener(node.Addr, tlsCfg)
 		case "mtls":
@@ -611,6 +645,10 @@ func (r *route) GenRouters() ([]router, error) {
 			handler = gost.DNSHandler(node.Remote)
 		case "relay":
 			handler = gost.RelayHandler(node.Remote)
+		case "xor":
+			// -L=XOR://... user-facing listener: decrypted bytes either
+			// bridge through the noport hub (if any) or auto-handle locally.
+			handler = gost.AutoHandler()
 		default:
 			// start from 2.5, if remote is not empty, then we assume that it is a forward tunnel.
 			if node.Remote != "" {
@@ -618,6 +656,16 @@ func (r *route) GenRouters() ([]router, error) {
 			} else {
 				handler = gost.AutoHandler()
 			}
+		}
+
+		// NOPORT bridging: if any -R=admin:// is configured on this side,
+		// forward all -L= listener traffic through the registered hub.
+		if noportEnabled {
+			proto := node.Protocol
+			if proto == "" || node.Transport == "xor" {
+				proto = "auto"
+			}
+			handler = gost.NoportBridgeHandler(proto, noportXORKey)
 		}
 
 		var whitelist, blacklist *gost.Permissions
@@ -694,9 +742,16 @@ type router struct {
 	chain    *gost.Chain
 	resolver gost.Resolver
 	hosts    *gost.Hosts
+	client   *gost.AdminClient // NOPORT A-side admin tunnel; mutually exclusive with server
 }
 
 func (r *router) Serve() error {
+	if r.client != nil {
+		log.Logf("noport tunnel %s -> %s (data %s)",
+			r.node.String(), r.client.BAddr, r.client.DataAddr)
+		r.client.Run(context.Background())
+		return nil
+	}
 	log.Logf("%s on %s", r.node.String(), r.server.Addr())
 	return r.server.Serve(r.handler)
 }
@@ -706,4 +761,124 @@ func (r *router) Close() error {
 		return nil
 	}
 	return r.server.Close()
+}
+
+// nodePassword returns the password component of node.User, or "" if absent.
+// In NOPORT URLs (`xor://user@key:host:port`) the password is the encryption key.
+func nodePassword(node gost.Node) string {
+	if node.User == nil {
+		return ""
+	}
+	if pw, ok := node.User.Password(); ok {
+		return pw
+	}
+	// fall back to username when only one token is provided
+	return node.User.Username()
+}
+
+// noportContext inspects ReverseNodes and returns whether NOPORT bridging
+// should be enabled (any -R=admin:// present) and the XOR key for user-side
+// data-queue encryption (taken from that admin URL).
+func noportContext(reverseNodes stringList) (bool, []byte) {
+	for _, ns := range reverseNodes {
+		node, err := gost.ParseNode(ns)
+		if err != nil {
+			continue
+		}
+		if node.Transport == "admin" || node.Protocol == "admin" {
+			return true, []byte(nodePassword(node))
+		}
+	}
+	return false, nil
+}
+
+// genReverseRouter handles -R=admin:// and -R=XOR:// listeners on Host B.
+func genReverseRouter(ns string) (router, error) {
+	node, err := gost.ParseNode(ns)
+	if err != nil {
+		return router{}, err
+	}
+	if node.User == nil {
+		return router{}, fmt.Errorf("noport: -R=%s requires user@key", ns)
+	}
+	user := node.User.Username()
+	key := []byte(nodePassword(node))
+
+	switch node.Transport {
+	case "admin":
+		ln, err := gost.AdminListener(node.Addr)
+		if err != nil {
+			return router{}, err
+		}
+		opts := gost.DefaultHubOptions()
+		if v := node.GetInt("pool"); v > 0 {
+			opts.PoolSize = v
+		}
+		if v := node.GetInt("bigflow_kbps"); v > 0 {
+			opts.BigflowKBps = v
+		}
+		if v := node.GetInt("bigflow_secs"); v > 0 {
+			opts.BigflowSeconds = v
+		}
+		h := gost.AdminHandler(user, key, opts)
+		return router{
+			node:    node,
+			server:  &gost.Server{Listener: ln},
+			handler: h,
+		}, nil
+	case "xor":
+		// Note: this is the *data queue* listener, not a user-facing XOR
+		// listener. Use a plain TCP listener; QUEUE_HELLO framing is read
+		// by NoportDataQueueHandler.
+		ln, err := gost.TCPListener(node.Addr)
+		if err != nil {
+			return router{}, err
+		}
+		h := gost.NoportDataQueueHandler(user)
+		return router{
+			node:    node,
+			server:  &gost.Server{Listener: ln},
+			handler: h,
+		}, nil
+	default:
+		return router{}, fmt.Errorf("noport: unsupported -R transport %q", node.Transport)
+	}
+}
+
+// genTunnelRouter wraps an A-side AdminClient as a degenerate router so
+// main.go's serve loop drives it.
+func genTunnelRouter(ns string) (router, error) {
+	node, err := gost.ParseNode(ns)
+	if err != nil {
+		return router{}, err
+	}
+	if node.User == nil {
+		return router{}, fmt.Errorf("noport: -T=%s requires user@key", ns)
+	}
+	if node.Transport != "admin" {
+		return router{}, fmt.Errorf("noport: -T transport must be admin, got %q", node.Transport)
+	}
+	dport := node.GetInt("dport")
+	if dport <= 0 {
+		return router{}, fmt.Errorf("noport: -T=%s requires ?dport=NNN (B's data-queue port)", ns)
+	}
+	host, _, err := net.SplitHostPort(node.Addr)
+	if err != nil {
+		return router{}, err
+	}
+	pool := node.GetInt("pool")
+	if pool <= 0 {
+		pool = 16
+	}
+	c := &gost.AdminClient{
+		BAddr:    node.Addr,
+		DataAddr: net.JoinHostPort(host, fmt.Sprintf("%d", dport)),
+		User:     node.User.Username(),
+		AuthKey:  []byte(nodePassword(node)),
+		PoolSize: pool,
+	}
+	return router{
+		node:   node,
+		client: c,
+	}, nil
 }

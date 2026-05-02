@@ -91,6 +91,7 @@ func ParseNode(s string) (node Node, err error) {
 	case "dns":
 	case "redu", "redirectu": // UDP tproxy
 	case "vsock":
+	case "xor", "admin": // NOPORT reverse-tunnel
 	default:
 		node.Transport = "tcp"
 	}
@@ -113,6 +114,7 @@ func ParseNode(s string) (node Node, err error) {
 	case "ftcp": // fake TCP
 	case "dns", "dot", "doh":
 	case "relay":
+	case "xor", "admin": // NOPORT reverse-tunnel
 	default:
 		node.Protocol = ""
 	}

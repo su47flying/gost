@@ -31,6 +31,8 @@ func init() {
 
 	flag.Var(&baseCfg.route.ChainNodes, "F", "forward address, can make a forward chain")
 	flag.Var(&baseCfg.route.ServeNodes, "L", "listen address, can listen on multiple ports (required)")
+	flag.Var(&baseCfg.route.ReverseNodes, "R", "reverse-tunnel listen address (NOPORT admin/data-queue)")
+	flag.Var(&baseCfg.route.TunnelNodes, "T", "admin tunnel client target (NOPORT host A side)")
 	flag.IntVar(&baseCfg.route.Mark, "M", 0, "Specify out connection mark")
 	flag.StringVar(&configureFile, "C", "", "configure file")
 	flag.StringVar(&baseCfg.route.Interface, "I", "", "Interface to bind")
