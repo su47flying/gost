@@ -149,3 +149,18 @@ func waitForCondition(d time.Duration, pred func() bool) bool {
 	}
 	return pred()
 }
+
+func TestResolveDataAddrWildcard(t *testing.T) {
+	c := &AdminClient{addr: "1.2.3.4:36962"}
+	cases := map[string]string{
+		"[::]:36963":    "1.2.3.4:36963",
+		"0.0.0.0:36963": "1.2.3.4:36963",
+		":36963":        "1.2.3.4:36963",
+		"5.6.7.8:36963": "5.6.7.8:36963",
+	}
+	for in, want := range cases {
+		if got := c.resolveDataAddr(in); got != want {
+			t.Errorf("resolveDataAddr(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

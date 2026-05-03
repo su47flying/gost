@@ -543,6 +543,7 @@ func (c *AdminClient) session() error {
 				log.Logf("[admin] bad OPEN_QUEUE: %s", err)
 				continue
 			}
+			dataAddr = c.resolveDataAddr(dataAddr)
 			log.Logf("[admin] OPEN_QUEUE %s pool=%d", dataAddr, count)
 			for i := 0; i < count; i++ {
 				go c.runDataConn(dataAddr)
@@ -631,6 +632,25 @@ func (c *AdminClient) runDataConn(dataAddr string) {
 	go c.runDataConn(dataAddr)
 
 	c.handleConnect(conn, f.Payload)
+}
+
+// resolveDataAddr substitutes B's admin host for a wildcard/empty host
+// in the dataAddr advertised via OPEN_QUEUE, so A can actually dial it
+// when B has only bound 0.0.0.0/[::] for its socksSimple listener.
+func (c *AdminClient) resolveDataAddr(dataAddr string) string {
+	host, port, err := net.SplitHostPort(dataAddr)
+	if err != nil {
+		return dataAddr
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		adminHost, _, err := net.SplitHostPort(c.addr)
+		if err != nil || adminHost == "" {
+			return dataAddr
+		}
+		return net.JoinHostPort(adminHost, port)
+	}
+	return dataAddr
 }
 
 func (c *AdminClient) handleConnect(conn net.Conn, payload []byte) {
