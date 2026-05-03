@@ -1,10 +1,19 @@
 package gost
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // TestNoportSocks5ViaTunnel exercises the full A+B+C+target path:
@@ -163,4 +172,263 @@ func TestResolveDataAddrWildcard(t *testing.T) {
 			t.Errorf("resolveDataAddr(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// TestNoportConcurrentLargeStream simulates a YouTube-app-like load:
+// many parallel HTTP requests through the SOCKS5/hub chain, each
+// downloading a sizable body. Verifies data integrity and that the
+// pool refill keeps up under burst.
+func TestNoportConcurrentLargeStream(t *testing.T) {
+	user := url.UserPassword("u", "k")
+
+	const chunk = 256 * 1024 // 256 KiB per response
+	payload := make([]byte, chunk)
+	for i := range payload {
+		payload[i] = byte(i * 31)
+	}
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+		w.Write(payload)
+	}))
+	defer originSrv.Close()
+
+	hub := NewAdminHub("", 4) // small pool to force refill
+
+	dataLn, err := SocksSimpleListener("127.0.0.1:0", user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSrv := &Server{Listener: dataLn}
+	go dataSrv.Serve(SocksSimpleHandlerWithHubExported(user, hub,
+		AddrHandlerOption(dataLn.Addr().String()), UsersHandlerOption(user)))
+	defer dataSrv.Close()
+	SetAdminHubDataAddr(hub, dataLn.Addr().String())
+
+	adminLn, err := AdminListener("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSrv := &Server{Listener: adminLn}
+	go adminSrv.Serve(AdminHandler(user, hub,
+		AddrHandlerOption(adminLn.Addr().String()), UsersHandlerOption(user)))
+	defer adminSrv.Close()
+
+	socks5Ln, err := TCPListener("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socks5Srv := &Server{Listener: socks5Ln}
+	go socks5Srv.Serve(SOCKS5Handler(
+		AddrHandlerOption(socks5Ln.Addr().String()),
+		ChainHandlerOption(NewHubChain(hub)),
+	))
+	defer socks5Srv.Close()
+
+	a := NewAdminClient(adminLn.Addr().String(), user)
+	a.Start()
+	defer a.Close()
+
+	if !waitForCondition(2*time.Second, func() bool {
+		s := hub.pickSession()
+		if s == nil {
+			return false
+		}
+		s.queueMu.Lock()
+		n := len(s.queue)
+		s.queueMu.Unlock()
+		return n >= 4
+	}) {
+		t.Fatal("pool never filled")
+	}
+
+	const concurrency = 16
+	const perWorker = 3
+	hash := sha256.Sum256(payload)
+	wantHash := hash[:]
+
+	socks5Addr, err := net.ResolveTCPAddr("tcp", socks5Ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, err := proxy.SOCKS5("tcp", socks5Addr.String(), nil, proxy.Direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &http.Transport{
+		Dial: dialer.Dial,
+		// Disable connection reuse so each request goes through a fresh tunnel.
+		DisableKeepAlives: true,
+	}
+	hc := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+
+	errCh := make(chan error, concurrency*perWorker)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				resp, err := hc.Get(originSrv.URL)
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d req %d: %w", id, j, err)
+					return
+				}
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d req %d read: %w", id, j, err)
+					return
+				}
+				gotHash := sha256.Sum256(body)
+				if !bytes.Equal(gotHash[:], wantHash) {
+					errCh <- fmt.Errorf("worker %d req %d: payload mismatch (len=%d)", id, j, len(body))
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// TestNoportUDPAssociateRelay verifies that SOCKS5 UDP_ASSOCIATE through
+// the noport hub chain correctly relays datagrams. Without this support
+// QUIC-based clients (notably iOS YouTube App / Cronet) lose all video
+// frames while non-QUIC apps continue to work.
+func TestNoportUDPAssociateRelay(t *testing.T) {
+	user := url.UserPassword("u", "k")
+	hub := NewAdminHub("", 4)
+
+	dataLn, err := SocksSimpleListener("127.0.0.1:0", user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataSrv := &Server{Listener: dataLn}
+	go dataSrv.Serve(SocksSimpleHandlerWithHubExported(user, hub,
+		AddrHandlerOption(dataLn.Addr().String()), UsersHandlerOption(user)))
+	defer dataSrv.Close()
+	SetAdminHubDataAddr(hub, dataLn.Addr().String())
+
+	adminLn, err := AdminListener("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSrv := &Server{Listener: adminLn}
+	go adminSrv.Serve(AdminHandler(user, hub,
+		AddrHandlerOption(adminLn.Addr().String()), UsersHandlerOption(user)))
+	defer adminSrv.Close()
+
+	socks5Ln, err := TCPListener("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socks5Srv := &Server{Listener: socks5Ln}
+	go socks5Srv.Serve(SOCKS5Handler(
+		AddrHandlerOption(socks5Ln.Addr().String()),
+		ChainHandlerOption(NewHubChain(hub))))
+	defer socks5Srv.Close()
+
+	a := NewAdminClient(adminLn.Addr().String(), user)
+	a.Start()
+	defer a.Close()
+
+	if !waitForCondition(2*time.Second, func() bool {
+		return hub.SessionCount() > 0
+	}) {
+		t.Fatal("session never registered")
+	}
+
+	// Stand up an echo UDP server.
+	udpEcho, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpEcho.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, peer, err := udpEcho.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			udpEcho.WriteTo(buf[:n], peer)
+		}
+	}()
+
+	// Drive the SOCKS5 client manually so we can test UDP_ASSOCIATE.
+	c, err := net.Dial("tcp", socks5Ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Greeting (no auth): 05 01 00
+	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(c, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		t.Fatalf("greeting reply: %v", resp)
+	}
+	// UDP_ASSOCIATE request: VER=5 CMD=3 RSV=0 ATYP=1 0.0.0.0 :0
+	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		t.Fatalf("UDP_ASSOCIATE reply header read failed: %v", err)
+	}
+	if hdr[0] != 0x05 {
+		t.Fatalf("bad reply ver=%x", hdr[0])
+	}
+	if hdr[1] != 0x00 {
+		t.Fatalf("UDP_ASSOCIATE failed (rep=%d) — UDP relay broken", hdr[1])
+	}
+	// Read the rest of reply (BND.ADDR + BND.PORT)
+	rest := make([]byte, 4+2) // IPv4 + port
+	if _, err := io.ReadFull(c, rest); err != nil {
+		t.Fatalf("read bnd: %v", err)
+	}
+	bndIP := net.IPv4(rest[0], rest[1], rest[2], rest[3])
+	bndPort := int(rest[4])<<8 | int(rest[5])
+	if bndIP.IsUnspecified() {
+		bndIP = net.ParseIP("127.0.0.1")
+	}
+	bnd := &net.UDPAddr{IP: bndIP, Port: bndPort}
+	t.Logf("UDP_ASSOCIATE replied success, BND=%s", bnd)
+
+	udpClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpClient.Close()
+
+	// SOCKS5 UDP datagram framing: RSV=0,0 FRAG=0 ATYP=1 IP4 PORT DATA
+	echoAddr := udpEcho.LocalAddr().(*net.UDPAddr)
+	pkt := []byte{0, 0, 0, 0x01, echoAddr.IP.To4()[0], echoAddr.IP.To4()[1], echoAddr.IP.To4()[2], echoAddr.IP.To4()[3]}
+	pkt = append(pkt, byte(echoAddr.Port>>8), byte(echoAddr.Port))
+	payload := []byte("ping-via-quic-style")
+	pkt = append(pkt, payload...)
+
+	if _, err := udpClient.WriteTo(pkt, bnd); err != nil {
+		t.Fatal(err)
+	}
+	udpClient.SetReadDeadline(time.Now().Add(3 * time.Second))
+	rbuf := make([]byte, 2048)
+	n, _, err := udpClient.ReadFrom(rbuf)
+	if err != nil {
+		t.Fatalf("UDP relay broken: did not receive echo back: %v", err)
+	}
+	// Reply is also SOCKS5-framed: skip 4-byte header + IP + port = 10
+	if n < 10 || !bytes.Equal(rbuf[10:n], payload) {
+		t.Fatalf("UDP echo mismatch: got %q want suffix %q", rbuf[:n], payload)
+	}
+	t.Logf("✓ UDP relay through noport chain works: echoed %d bytes", n-10)
 }

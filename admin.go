@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-gost/gosocks5"
 	"github.com/go-log/log"
 )
 
@@ -581,10 +583,11 @@ func parseOpenQueue(p []byte) (string, int, error) {
 	return strings.TrimSpace(parts[0]), n, nil
 }
 
-// runDataConn opens one data-queue conn to B, sends HELLO, then waits for
-// a CONNECT frame. On receipt it dials the target, replies CONNECT_ACK and
-// bridges. After the connection is consumed it spawns a fresh worker so
-// that the idle-pool size on B stays approximately constant.
+// runDataConn opens one data-queue conn to B, sends HELLO, then idles
+// in the B-side hub pool until B starts speaking SOCKS5 on it. Once the
+// first byte arrives we refill the pool and serve the conn as a SOCKS5
+// server so that B's user-facing handlers can use either CmdConnect
+// (TCP) or CmdUDPTun (UDP relay for QUIC etc.) transparently.
 func (c *AdminClient) runDataConn(dataAddr string) {
 	if c.isClosed() {
 		return
@@ -616,22 +619,43 @@ func (c *AdminClient) runDataConn(dataAddr string) {
 		return
 	}
 
-	// Now block until B sends a CONNECT (this can take a long time).
-	f, err := ReadFrame(conn)
-	if err != nil {
-		conn.Close()
-		return
-	}
-	if f.Type != FrameTypeData || f.Cmd != DataCmdConnect {
-		log.Logf("[noport] unexpected frame on data conn: type=%d cmd=%d", f.Type, f.Cmd)
+	// Block until B sends the first SOCKS5 byte (could be a long time).
+	one := make([]byte, 1)
+	if _, err := io.ReadFull(conn, one); err != nil {
 		conn.Close()
 		return
 	}
 
-	// Refill the pool: this conn has been consumed.
+	// Refill the pool: this conn is now being consumed.
 	go c.runDataConn(dataAddr)
 
-	c.handleConnect(conn, f.Payload)
+	c.serveSocks5(&peekableConn{Conn: conn, buf: one})
+}
+
+// serveSocks5 runs a one-shot gost SOCKS5 server on the data conn so B
+// can drive both TCP CmdConnect and UDP CmdUDPTun against this Host A.
+func (c *AdminClient) serveSocks5(conn net.Conn) {
+	h := SOCKS5Handler()
+	h.Handle(conn)
+}
+
+// peekableConn prepends a small buffer to the next reads of the
+// underlying net.Conn while transparently delegating everything else.
+type peekableConn struct {
+	net.Conn
+	buf []byte
+}
+
+func (p *peekableConn) Read(b []byte) (int, error) {
+	if len(p.buf) > 0 {
+		n := copy(b, p.buf)
+		p.buf = p.buf[n:]
+		if len(p.buf) == 0 {
+			p.buf = nil
+		}
+		return n, nil
+	}
+	return p.Conn.Read(b)
 }
 
 // resolveDataAddr substitutes B's admin host for a wildcard/empty host
@@ -654,25 +678,10 @@ func (c *AdminClient) resolveDataAddr(dataAddr string) string {
 }
 
 func (c *AdminClient) handleConnect(conn net.Conn, payload []byte) {
-	defer conn.Close()
-	network, addr, err := parseConnectPayload(payload)
-	if err != nil {
-		_ = WriteFrame(conn, Frame{Type: FrameTypeData, Cmd: DataCmdConnectAck, Payload: []byte(err.Error())})
-		return
-	}
-	target, err := net.DialTimeout(network, addr, DialTimeout)
-	if err != nil {
-		log.Logf("[noport] target dial %s: %s", addr, err)
-		_ = WriteFrame(conn, Frame{Type: FrameTypeData, Cmd: DataCmdConnectAck, Payload: []byte(err.Error())})
-		return
-	}
-	defer target.Close()
-	if err := WriteFrame(conn, Frame{Type: FrameTypeData, Cmd: DataCmdConnectAck, Payload: []byte("ok")}); err != nil {
-		return
-	}
-	log.Logf("[noport] %s <-> %s", conn.RemoteAddr(), addr)
-	transport(conn, target)
-	log.Logf("[noport] %s >-< %s", conn.RemoteAddr(), addr)
+	// Deprecated frame-based path; retained as a no-op to keep the
+	// symbol around while the wire protocol switches to native SOCKS5.
+	_ = conn
+	_ = payload
 }
 
 // ============================================================================
@@ -726,22 +735,36 @@ func (c *hubConnector) ConnectContext(ctx context.Context, conn net.Conn, networ
 	default:
 		return nil, fmt.Errorf("noport: unsupported network %q", network)
 	}
-	if err := WriteFrame(conn, Frame{
-		Type:    FrameTypeData,
-		Cmd:     DataCmdConnect,
-		Payload: []byte(network + " " + addr),
-	}); err != nil {
+	// A's data conn worker now serves a one-shot SOCKS5 server on the
+	// post-HELLO conn, so we drive it as a normal SOCKS5 client. This
+	// lets B's user-facing handlers transparently relay both TCP
+	// CmdConnect and UDP CmdUDPTun (for QUIC) through the tunnel.
+	cc, err := socks5Handshake(conn, noTLSSocks5HandshakeOption(true))
+	if err != nil {
+		return nil, fmt.Errorf("noport: socks5 handshake: %w", err)
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("noport: parse addr: %w", err)
+	}
+	portN, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("noport: parse port: %w", err)
+	}
+	req := gosocks5.NewRequest(gosocks5.CmdConnect, &gosocks5.Addr{
+		Type: gosocks5.AddrDomain,
+		Host: host,
+		Port: uint16(portN),
+	})
+	if err := req.Write(cc); err != nil {
 		return nil, fmt.Errorf("noport: write CONNECT: %w", err)
 	}
-	ack, err := ReadFrame(conn)
+	reply, err := gosocks5.ReadReply(cc)
 	if err != nil {
-		return nil, fmt.Errorf("noport: read CONNECT_ACK: %w", err)
+		return nil, fmt.Errorf("noport: read CONNECT reply: %w", err)
 	}
-	if ack.Type != FrameTypeData || ack.Cmd != DataCmdConnectAck {
-		return nil, fmt.Errorf("noport: unexpected ack type=%d cmd=%d", ack.Type, ack.Cmd)
+	if reply.Rep != gosocks5.Succeeded {
+		return nil, fmt.Errorf("noport: connect rejected (rep=%d)", reply.Rep)
 	}
-	if string(ack.Payload) != "ok" {
-		return nil, fmt.Errorf("noport: connect rejected: %s", string(ack.Payload))
-	}
-	return conn, nil
+	return cc, nil
 }
