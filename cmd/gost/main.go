@@ -31,6 +31,8 @@ func init() {
 
 	flag.Var(&baseCfg.route.ChainNodes, "F", "forward address, can make a forward chain")
 	flag.Var(&baseCfg.route.ServeNodes, "L", "listen address, can listen on multiple ports (required)")
+	flag.Var(&baseCfg.route.ReverseServeNodes, "R", "noport reverse listen address (admin or socksSimple), can be repeated")
+	flag.Var(&baseCfg.route.AdminTunnels, "T", "noport admin tunnel address, e.g. admin://user:key@host:port")
 	flag.IntVar(&baseCfg.route.Mark, "M", 0, "Specify out connection mark")
 	flag.StringVar(&configureFile, "C", "", "configure file")
 	flag.StringVar(&baseCfg.route.Interface, "I", "", "Interface to bind")
@@ -112,7 +114,7 @@ func start() error {
 		routers = append(routers, rts...)
 	}
 
-	if len(routers) == 0 {
+	if len(routers) == 0 && len(baseCfg.route.AdminTunnels) == 0 {
 		return errors.New("invalid config")
 	}
 	for i := range routers {

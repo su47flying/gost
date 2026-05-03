@@ -27,11 +27,13 @@ func (l *stringList) Set(value string) error {
 }
 
 type route struct {
-	ServeNodes stringList
-	ChainNodes stringList
-	Retries    int
-	Mark       int
-	Interface  string
+	ServeNodes        stringList
+	ChainNodes        stringList
+	ReverseServeNodes stringList
+	AdminTunnels      stringList
+	Retries           int
+	Mark              int
+	Interface         string
 }
 
 func (r *route) parseChain() (*gost.Chain, error) {
@@ -351,7 +353,22 @@ func (r *route) GenRouters() ([]router, error) {
 		return nil, err
 	}
 
+	// Start any -T admin tunnels (Host A side). Each runs its own goroutine
+	// and reconnects independently; they don't produce a router entry.
+	for _, ts := range r.AdminTunnels {
+		if err := startAdminTunnel(ts); err != nil {
+			return nil, err
+		}
+	}
+
+	// Build the reverse-side hub from -R entries (Host B side).
+	hub, reverseRouters, err := buildReverseRouters(r.ReverseServeNodes)
+	if err != nil {
+		return nil, err
+	}
+
 	var rts []router
+	rts = append(rts, reverseRouters...)
 
 	for _, ns := range r.ServeNodes {
 		node, err := gost.ParseNode(ns)
@@ -647,9 +664,14 @@ func (r *route) GenRouters() ([]router, error) {
 			)
 		}
 
+		effectiveChain := chain
+		if effectiveChain.IsEmpty() && hub != nil {
+			effectiveChain = gost.NewHubChain(hub)
+		}
+
 		handler.Init(
 			gost.AddrHandlerOption(ln.Addr().String()),
-			gost.ChainHandlerOption(chain),
+			gost.ChainHandlerOption(effectiveChain),
 			gost.UsersHandlerOption(node.User),
 			gost.AuthenticatorHandlerOption(authenticator),
 			gost.TLSConfigHandlerOption(tlsCfg),
@@ -706,4 +728,141 @@ func (r *router) Close() error {
 		return nil
 	}
 	return r.server.Close()
+}
+
+// ============================================================================
+// noport (-T / -R) wiring
+// ============================================================================
+
+func startAdminTunnel(ns string) error {
+	node, err := gost.ParseNode(ns)
+	if err != nil {
+		return fmt.Errorf("admin tunnel: %w", err)
+	}
+	if node.Protocol != "admin" {
+		return fmt.Errorf("admin tunnel %q: scheme must be admin://", ns)
+	}
+	if node.User == nil {
+		return fmt.Errorf("admin tunnel %q: missing user:key", ns)
+	}
+	if _, pass := node.User.Username(), ""; pass == "" {
+		if _, ok := node.User.Password(); !ok {
+			return fmt.Errorf("admin tunnel %q: missing password", ns)
+		}
+	}
+	c := gost.NewAdminClient(node.Addr, node.User)
+	c.Start()
+	log.Logf("[admin] -T tunnel started: peer=%s user=%s", node.Addr, node.User.Username())
+	return nil
+}
+
+// buildReverseRouters parses -R entries, sets up an AdminHub if any
+// admin/socksSimple entries are present, and returns one router per entry.
+func buildReverseRouters(nss []string) (*gost.AdminHub, []router, error) {
+	if len(nss) == 0 {
+		return nil, nil, nil
+	}
+
+	type rev struct {
+		ns   string
+		node gost.Node
+	}
+	var entries []rev
+	var (
+		adminUser  *url.Userinfo
+		dataAddrUR string
+		poolSize   int
+		hasAdmin   bool
+		hasData    bool
+	)
+	for _, ns := range nss {
+		node, err := gost.ParseNode(ns)
+		if err != nil {
+			return nil, nil, fmt.Errorf("-R %q: %w", ns, err)
+		}
+		switch node.Protocol {
+		case "admin":
+			if hasAdmin {
+				return nil, nil, fmt.Errorf("-R %q: duplicate admin listener", ns)
+			}
+			hasAdmin = true
+			adminUser = node.User
+			if v := node.Get("dataAddr"); v != "" {
+				dataAddrUR = v
+			}
+			if v := node.GetInt("pool"); v > 0 {
+				poolSize = v
+			}
+		case "sockssimple":
+			hasData = true
+			if adminUser == nil {
+				adminUser = node.User
+			}
+			if v := node.Get("dataAddr"); v != "" && dataAddrUR == "" {
+				dataAddrUR = v
+			}
+			if poolSize == 0 {
+				if v := node.GetInt("pool"); v > 0 {
+					poolSize = v
+				}
+			}
+		default:
+			return nil, nil, fmt.Errorf("-R %q: unsupported protocol %q (admin or socksSimple expected)", ns, node.Protocol)
+		}
+		entries = append(entries, rev{ns: ns, node: node})
+	}
+	if !hasAdmin || !hasData {
+		return nil, nil, fmt.Errorf("-R requires both admin:// and socksSimple:// listeners")
+	}
+	if poolSize == 0 {
+		poolSize = 8
+	}
+
+	hub := gost.NewAdminHub(dataAddrUR, poolSize)
+
+	var rts []router
+	var dataLnAddr string
+	for _, e := range entries {
+		switch e.node.Protocol {
+		case "admin":
+			ln, err := gost.AdminListener(e.node.Addr)
+			if err != nil {
+				return nil, nil, fmt.Errorf("-R %q: %w", e.ns, err)
+			}
+			h := gost.AdminHandler(adminUser, hub,
+				gost.AddrHandlerOption(ln.Addr().String()),
+				gost.UsersHandlerOption(adminUser),
+			)
+			rts = append(rts, router{
+				node:    e.node,
+				server:  &gost.Server{Listener: ln},
+				handler: h,
+			})
+		case "sockssimple":
+			ln, err := gost.SocksSimpleListener(e.node.Addr, e.node.User)
+			if err != nil {
+				return nil, nil, fmt.Errorf("-R %q: %w", e.ns, err)
+			}
+			dataLnAddr = ln.Addr().String()
+			h := gost.SocksSimpleHandlerWithHubExported(e.node.User, hub,
+				gost.AddrHandlerOption(ln.Addr().String()),
+				gost.UsersHandlerOption(e.node.User),
+			)
+			rts = append(rts, router{
+				node:    e.node,
+				server:  &gost.Server{Listener: ln},
+				handler: h,
+			})
+		}
+	}
+
+	// If dataAddr wasn't explicitly configured, fall back to the bound
+	// socksSimple listener address (useful for tests on 127.0.0.1).
+	if hub.DataAddr() == "" && dataLnAddr != "" {
+		gost.SetAdminHubDataAddr(hub, dataLnAddr)
+	}
+	if hub.DataAddr() == "" {
+		return nil, nil, fmt.Errorf("-R: dataAddr must be set on admin:// (use ?dataAddr=host:port)")
+	}
+	return hub, rts, nil
 }
