@@ -583,6 +583,8 @@ func (r *route) GenRouters() ([]router, error) {
 				Backlog:   node.GetInt("backlog"),
 				QueueSize: node.GetInt("queue"),
 			})
+		case "sockssimple":
+			ln, err = gost.SocksSimpleListener(node.Addr, node.User)
 		default:
 			ln, err = gost.TCPListener(node.Addr)
 		}
@@ -618,6 +620,8 @@ func (r *route) GenRouters() ([]router, error) {
 			handler = gost.UDPRedirectHandler()
 		case "ssu":
 			handler = gost.ShadowUDPHandler()
+		case "sockssimple":
+			handler = gost.SocksSimpleHandler(node.User)
 		case "sni":
 			handler = gost.SNIHandler()
 		case "tun":
