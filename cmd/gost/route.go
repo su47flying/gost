@@ -246,6 +246,8 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		tr = gost.UDPTransporter()
 	case "vsock":
 		tr = gost.VSOCKTransporter()
+	case "sockssimple":
+		tr = gost.SocksSimpleTransporter(node.User)
 	default:
 		tr = gost.TCPTransporter()
 	}
@@ -276,6 +278,8 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		connector = gost.HTTPConnector(node.User)
 	case "relay":
 		connector = gost.RelayConnector(node.User)
+	case "sockssimple":
+		connector = gost.SocksSimpleConnector(node.User)
 	default:
 		connector = gost.AutoConnector(node.User)
 	}
