@@ -37,6 +37,16 @@ const (
 	adminPingInterval   = 30 * time.Second
 	adminAuthTimeout    = 10 * time.Second
 	adminAcquireTimeout = 30 * time.Second
+	// dataDialBackoffMin/Max bound the exponential backoff used when
+	// Host A fails to dial a data-queue conn back to Host B. The loop
+	// retries indefinitely (until the AdminClient is closed) so the
+	// pool can self-heal after a network blip without requiring a
+	// process restart or a new OPEN_QUEUE from B.
+	dataDialBackoffMin = 1 * time.Second
+	dataDialBackoffMax = 30 * time.Second
+	// refillRequestMinInterval rate-limits OPEN_QUEUE refill requests
+	// that the B-side hub sends to A when Acquire times out.
+	refillRequestMinInterval = 5 * time.Second
 )
 
 var (
@@ -104,8 +114,46 @@ type adminSession struct {
 	queue   []net.Conn
 	signal  chan struct{} // signaled when a new conn is enqueued
 
+	writeMu      sync.Mutex // serializes WriteFrame on conn
+	lastRefillMu sync.Mutex
+	lastRefill   time.Time
+
 	closeOnce sync.Once
 	done      chan struct{}
+}
+
+// writeFrame serializes WriteFrame on the admin (control) conn so that
+// multiple goroutines (e.g. the read loop sending PONG, and Acquire
+// sending refill OPEN_QUEUE) can safely share the same connection.
+func (s *adminSession) writeFrame(f Frame) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return WriteFrame(s.conn, f)
+}
+
+// requestRefill asks Host A to top up the data-queue pool by sending a
+// fresh OPEN_QUEUE frame on the admin channel. Rate-limited so a burst
+// of acquire timeouts does not flood A.
+func (s *adminSession) requestRefill() {
+	s.lastRefillMu.Lock()
+	if time.Since(s.lastRefill) < refillRequestMinInterval {
+		s.lastRefillMu.Unlock()
+		return
+	}
+	s.lastRefill = time.Now()
+	s.lastRefillMu.Unlock()
+
+	payload := fmt.Sprintf("%s|%d", s.hub.dataAddr, s.hub.poolSize)
+	if err := s.writeFrame(Frame{
+		Type:    FrameTypeAdmin,
+		Cmd:     AdminCmdOpenQueue,
+		Payload: []byte(payload),
+	}); err != nil {
+		log.Logf("[noport] refill OPEN_QUEUE to %s: %s", s.user, err)
+	} else {
+		log.Logf("[noport] refill OPEN_QUEUE sent to user=%s pool=%d data=%s",
+			s.user, s.hub.poolSize, s.hub.dataAddr)
+	}
 }
 
 func newAdminSession(hub *AdminHub, user string, conn net.Conn) *adminSession {
@@ -244,6 +292,11 @@ func (h *AdminHub) Acquire(ctx context.Context) (net.Conn, error) {
 		case <-s.done:
 			return nil, ErrNoSession
 		case <-timer.C:
+			// Pool is empty and no new conn arrived in time; nudge
+			// Host A to refill in case its data-dial goroutines
+			// have all exited (e.g. before the indefinite-retry
+			// fix) or are stuck behind a long backoff.
+			go s.requestRefill()
 			return nil, ErrAcquireTimeout
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -365,12 +418,12 @@ func (h *adminHandler) Handle(conn net.Conn) {
 	defer clearSessionPassword(s)
 	defer h.hub.unregister(s)
 
-	if err := WriteFrame(conn, Frame{Type: FrameTypeAdmin, Cmd: AdminCmdAuthOK}); err != nil {
+	if err := s.writeFrame(Frame{Type: FrameTypeAdmin, Cmd: AdminCmdAuthOK}); err != nil {
 		log.Logf("[admin] %s: write AUTH_OK: %s", conn.RemoteAddr(), err)
 		return
 	}
 	openPayload := fmt.Sprintf("%s|%d", h.hub.dataAddr, h.hub.poolSize)
-	if err := WriteFrame(conn, Frame{
+	if err := s.writeFrame(Frame{
 		Type:    FrameTypeAdmin,
 		Cmd:     AdminCmdOpenQueue,
 		Payload: []byte(openPayload),
@@ -389,7 +442,7 @@ func (h *adminHandler) Handle(conn net.Conn) {
 			return
 		}
 		if f.Type == FrameTypeAdmin && f.Cmd == AdminCmdPing {
-			_ = WriteFrame(conn, Frame{Type: FrameTypeAdmin, Cmd: AdminCmdPong})
+			_ = s.writeFrame(Frame{Type: FrameTypeAdmin, Cmd: AdminCmdPong})
 		}
 	}
 }
@@ -592,20 +645,10 @@ func (c *AdminClient) runDataConn(dataAddr string) {
 	if c.isClosed() {
 		return
 	}
-	raw, err := net.DialTimeout("tcp", dataAddr, DialTimeout)
+	raw, err := c.dialDataConnWithBackoff(dataAddr)
 	if err != nil {
-		log.Logf("[noport] data conn dial %s: %s", dataAddr, err)
-		// Retry once after a small delay.
-		select {
-		case <-time.After(time.Second):
-		case <-c.stop:
-			return
-		}
-		raw, err = net.DialTimeout("tcp", dataAddr, DialTimeout)
-		if err != nil {
-			log.Logf("[noport] data conn dial %s (retry): %s", dataAddr, err)
-			return
-		}
+		// Only path out is c.stop being closed.
+		return
 	}
 	conn := NewXORConn(raw, []byte(c.pass))
 
@@ -630,6 +673,41 @@ func (c *AdminClient) runDataConn(dataAddr string) {
 	go c.runDataConn(dataAddr)
 
 	c.serveSocks5(&peekableConn{Conn: conn, buf: one})
+}
+
+// dialDataConnWithBackoff keeps retrying TCP dial to the B-side data
+// queue address with exponential backoff (capped) until it succeeds or
+// the AdminClient is closed. This makes the data-queue pool self-heal
+// after transient network failures without depending on B re-sending
+// OPEN_QUEUE.
+func (c *AdminClient) dialDataConnWithBackoff(dataAddr string) (net.Conn, error) {
+	backoff := dataDialBackoffMin
+	attempt := 0
+	for {
+		if c.isClosed() {
+			return nil, errors.New("admin client closed")
+		}
+		raw, err := net.DialTimeout("tcp", dataAddr, DialTimeout)
+		if err == nil {
+			return raw, nil
+		}
+		attempt++
+		// Log first failure at full detail, subsequent failures more
+		// sparsely so a long outage does not spam the log.
+		if attempt == 1 || attempt%10 == 0 {
+			log.Logf("[noport] data conn dial %s (attempt %d, backoff %s): %s",
+				dataAddr, attempt, backoff, err)
+		}
+		select {
+		case <-time.After(backoff):
+		case <-c.stop:
+			return nil, errors.New("admin client closed")
+		}
+		backoff *= 2
+		if backoff > dataDialBackoffMax {
+			backoff = dataDialBackoffMax
+		}
+	}
 }
 
 // serveSocks5 runs a one-shot gost SOCKS5 server on the data conn so B
