@@ -583,6 +583,18 @@ func (c *AdminClient) session() error {
 	// Heartbeat goroutine.
 	go c.heartbeat(conn)
 
+	// The data-queue pool is scoped to this admin session. When the session
+	// ends (admin conn drops), sessCancel unblocks any slot parked in dial
+	// backoff and pool.closeAll() closes the idle conns so slots parked in
+	// their blocking read wake up and exit. This prevents old slots from
+	// lingering across a reconnect (which would otherwise stack on top of the
+	// fresh batch spawned by the new session's OPEN_QUEUE).
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	defer sessCancel()
+	pool := newDataConnSet()
+	defer pool.closeAll()
+	poolStarted := false
+
 	for {
 		f, err := ReadFrame(conn)
 		if err != nil {
@@ -599,13 +611,76 @@ func (c *AdminClient) session() error {
 				continue
 			}
 			dataAddr = c.resolveDataAddr(dataAddr)
+			// The slots are self-maintaining: each rebuilds its own conn on
+			// death and refills after being consumed, so the pool holds a
+			// steady `count` live conns for the life of the session. Ignore
+			// duplicate/refill OPEN_QUEUE frames (B sends these on Acquire
+			// timeout) so they don't stack extra goroutines.
+			if poolStarted {
+				log.Logf("[admin] OPEN_QUEUE %s pool=%d (pool already running; ignored)", dataAddr, count)
+				continue
+			}
+			poolStarted = true
 			log.Logf("[admin] OPEN_QUEUE %s pool=%d", dataAddr, count)
 			for i := 0; i < count; i++ {
-				go c.runDataConn(dataAddr)
+				go c.runDataConn(sessCtx, pool, dataAddr)
 			}
 		case AdminCmdPong:
 			// ok
 		}
+	}
+}
+
+// dataConnSet tracks the live idle data-queue conns of a single admin
+// session so they can all be closed when the session ends. add reports
+// false once the set has been closed, letting a racing slot retire the
+// conn it just dialed instead of leaking it.
+type dataConnSet struct {
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
+}
+
+func newDataConnSet() *dataConnSet {
+	return &dataConnSet{conns: make(map[net.Conn]struct{})}
+}
+
+func (p *dataConnSet) add(c net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	p.conns[c] = struct{}{}
+	return true
+}
+
+func (p *dataConnSet) remove(c net.Conn) {
+	p.mu.Lock()
+	delete(p.conns, c)
+	p.mu.Unlock()
+}
+
+func (p *dataConnSet) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	for c := range p.conns {
+		_ = c.Close()
+	}
+	p.conns = nil
+}
+
+// sleep waits for d, returning false early if the client or session is
+// shutting down.
+func (c *AdminClient) sleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	case <-c.stop:
+		return false
 	}
 }
 
@@ -636,55 +711,82 @@ func parseOpenQueue(p []byte) (string, int, error) {
 	return strings.TrimSpace(parts[0]), n, nil
 }
 
-// runDataConn opens one data-queue conn to B, sends HELLO, then idles
-// in the B-side hub pool until B starts speaking SOCKS5 on it. Once the
-// first byte arrives we refill the pool and serve the conn as a SOCKS5
-// server so that B's user-facing handlers can use either CmdConnect
-// (TCP) or CmdUDPTun (UDP relay for QUIC etc.) transparently.
-func (c *AdminClient) runDataConn(dataAddr string) {
-	if c.isClosed() {
-		return
-	}
-	raw, err := c.dialDataConnWithBackoff(dataAddr)
-	if err != nil {
-		// Only path out is c.stop being closed.
-		return
-	}
-	conn := NewXORConn(raw, []byte(c.pass))
+// runDataConn owns a single slot in the data-queue pool for the life of
+// an admin session. It repeatedly establishes one conn to B, sends HELLO,
+// then idles in the B-side hub pool until B starts speaking SOCKS5 on it.
+//
+// Crucially it is a *loop*: whenever a conn is retired — whether it was
+// consumed by B, died while idle (network blip / NAT timeout / B closing
+// it), or failed HELLO — the same goroutine rebuilds a replacement. This
+// keeps the pool at a steady size without depending on B noticing an empty
+// pool and re-sending OPEN_QUEUE. When a conn is consumed the serving is
+// handed to a detached goroutine (so it survives an admin reconnect) and
+// the slot immediately loops to open a fresh idle conn.
+func (c *AdminClient) runDataConn(ctx context.Context, pool *dataConnSet, dataAddr string) {
+	for {
+		if c.isClosed() || ctx.Err() != nil {
+			return
+		}
+		raw, err := c.dialDataConnWithBackoff(ctx, dataAddr)
+		if err != nil {
+			// client closed or session ended.
+			return
+		}
+		conn := NewXORConn(raw, []byte(c.pass))
+		if !pool.add(conn) {
+			// Session ended between the dial and here; retire the conn.
+			conn.Close()
+			return
+		}
 
-	if err := WriteFrame(conn, Frame{
-		Type:    FrameTypeData,
-		Cmd:     DataCmdHello,
-		Payload: []byte(c.user + ":" + c.pass),
-	}); err != nil {
-		log.Logf("[noport] write HELLO: %s", err)
-		conn.Close()
-		return
+		if err := WriteFrame(conn, Frame{
+			Type:    FrameTypeData,
+			Cmd:     DataCmdHello,
+			Payload: []byte(c.user + ":" + c.pass),
+		}); err != nil {
+			log.Logf("[noport] write HELLO: %s", err)
+			pool.remove(conn)
+			conn.Close()
+			// Brief backoff so a peer that keeps dropping us right after
+			// connect can't spin this loop hot.
+			if !c.sleep(ctx, dataDialBackoffMin) {
+				return
+			}
+			continue
+		}
+
+		// Block until B sends the first SOCKS5 byte (could be a long time).
+		one := make([]byte, 1)
+		if _, err := io.ReadFull(conn, one); err != nil {
+			// The idle conn died (network blip, B closed it, or session
+			// teardown). Retire it and loop to rebuild the slot so the pool
+			// self-heals. A short backoff avoids a hot loop if the conn is
+			// being closed immediately on the B side (e.g. auth mismatch).
+			pool.remove(conn)
+			conn.Close()
+			if !c.sleep(ctx, dataDialBackoffMin) {
+				return
+			}
+			continue
+		}
+
+		// Consumed by B. Detach serving so it outlives this slot (and admin
+		// reconnects), then loop to refill the slot with a fresh idle conn.
+		pool.remove(conn)
+		go c.serveSocks5(&peekableConn{Conn: conn, buf: one})
 	}
-
-	// Block until B sends the first SOCKS5 byte (could be a long time).
-	one := make([]byte, 1)
-	if _, err := io.ReadFull(conn, one); err != nil {
-		conn.Close()
-		return
-	}
-
-	// Refill the pool: this conn is now being consumed.
-	go c.runDataConn(dataAddr)
-
-	c.serveSocks5(&peekableConn{Conn: conn, buf: one})
 }
 
 // dialDataConnWithBackoff keeps retrying TCP dial to the B-side data
-// queue address with exponential backoff (capped) until it succeeds or
-// the AdminClient is closed. This makes the data-queue pool self-heal
-// after transient network failures without depending on B re-sending
-// OPEN_QUEUE.
-func (c *AdminClient) dialDataConnWithBackoff(dataAddr string) (net.Conn, error) {
+// queue address with exponential backoff (capped) until it succeeds, the
+// AdminClient is closed, or the admin session ends. This makes the
+// data-queue pool self-heal after transient network failures without
+// depending on B re-sending OPEN_QUEUE.
+func (c *AdminClient) dialDataConnWithBackoff(ctx context.Context, dataAddr string) (net.Conn, error) {
 	backoff := dataDialBackoffMin
 	attempt := 0
 	for {
-		if c.isClosed() {
+		if c.isClosed() || ctx.Err() != nil {
 			return nil, errors.New("admin client closed")
 		}
 		raw, err := net.DialTimeout("tcp", dataAddr, DialTimeout)
@@ -702,6 +804,8 @@ func (c *AdminClient) dialDataConnWithBackoff(dataAddr string) (net.Conn, error)
 		case <-time.After(backoff):
 		case <-c.stop:
 			return nil, errors.New("admin client closed")
+		case <-ctx.Done():
+			return nil, errors.New("admin session ended")
 		}
 		backoff *= 2
 		if backoff > dataDialBackoffMax {
